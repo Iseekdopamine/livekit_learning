@@ -2,39 +2,79 @@ import logging
 
 from dotenv import load_dotenv
 from livekit import agents
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, room_io
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, TurnHandlingOptions, room_io
+from livekit.agents import llm, stt, tts, inference
 from livekit.plugins import noise_cancellation, silero
-# Import the multilingual turn detection model
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
 
 load_dotenv()
 
 
-# Define your agent's behavior by extending the Agent class
+# Agent personality: Telenetix tech support, Hindi + English
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="You are a helpful voice AI assistant.",  # System prompt for the LLM
+            instructions=(
+                "You are a friendly, patient voice support assistant for Telenetix, "
+                "a company that provides contact center software. "
+                "You help customers and their agents with Telenetix products: "
+                "TxContact (the contact center platform), TxHelpdesk (ticketing), TxDialer (outbound dialing), "
+                "TxSmartQConsole (queue and admin console), TxReport (reports), and TxRecord (call recording). "
+                "First find out which product the caller is using and what exactly is going wrong, "
+                "asking one short question at a time. "
+                "Then guide them through simple checks step by step, such as logging out and back in, "
+                "checking their internet connection, headset and microphone, browser, or user permissions. "
+                "Never guess product features or settings you are not sure about; say you will check with the team instead. "
+                "For server, licensing, installation or billing issues, or anything you cannot solve, "
+                "politely offer to raise a ticket and connect the caller to a human support engineer. "
+                "Reply in the same language the caller uses: Hindi, English, or a natural Hinglish mix. "
+                "Write Hindi words in Devanagari script, but keep product names and technical terms like "
+                "login, dialer, queue, report, recording and password in English. "
+                "Keep replies under 3 sentences."
+            ),
         )
 
 
 server = AgentServer()
 
 
-# The entrypoint function runs when a participant joins the room
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # Configure the voice pipeline with STT, LLM, TTS, and VAD providers
+    # Load VAD once so it can be reused
+    vad = silero.VAD.load()
+
     session = AgentSession(
-        stt="assemblyai/universal-streaming:en",  # Speech-to-text provider
-        llm="openai/gpt-4.1-mini",                # Language model for responses
-        tts="cartesia/sonic-3",                   # Text-to-speech voice
-        vad=silero.VAD.load(),                    # Voice activity detection
-        turn_detection=MultilingualModel(),  # Semantic turn detection
+        # LLM with fallback: OpenAI primary, Gemini backup
+        llm=llm.FallbackAdapter(
+            [
+                inference.LLM(model="openai/gpt-4.1-mini"),
+                inference.LLM(model="google/gemini-2.5-flash"),
+            ]
+        ),
+        # STT with fallback: both understand Hindi, English and Hinglish (multi mode)
+        stt=stt.FallbackAdapter(
+            [
+                inference.STT.from_model_string("deepgram/nova-3:multi"),
+                inference.STT(model="deepgram/flux-general-multi", language="multi"),
+            ]
+        ),
+        # TTS with fallback: Cartesia Hindi voice primary, Inworld backup
+        tts=tts.FallbackAdapter(
+            [
+                inference.TTS(
+                    model="cartesia/sonic-3.6",
+                    voice="4877b818-c7fe-4c89-b1cf-eadf8e23da72",
+                    language="hi",
+                ),
+                inference.TTS.from_model_string("inworld/inworld-tts-1"),
+            ]
+        ),
+        vad=vad,
+        # Semantic turn detection (built into the SDK, runs on LiveKit Inference)
+        turn_handling=TurnHandlingOptions(
+            turn_detection=inference.TurnDetector(),
+        ),
     )
 
-    # Start the session with noise cancellation enabled
     await session.start(
         agent=Assistant(),
         room=ctx.room,
